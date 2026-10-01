@@ -1,5 +1,6 @@
 // chain.js — 候选链构造与逐级核验。
-// 流程：解析 → 摘要去重 → 叶证书候选 → DFS 构造叶→锚候选链 →
+// 流程：解析 → 摘要去重 → 叶证书候选 → DFS 构造叶→锚候选链（同名候选签发者
+//       全部展开，覆盖续期 / 密钥轮换产生的同名不同钥中间 CA）→
 //       按 SHA-256 摘要序稳定排序 → 逐级核验（有效期 / CA 与 keyUsage /
 //       pathLenConstraint / 累积 DNS 名称约束 / 签名）→ 多链取摘要序最小者。
 
@@ -70,21 +71,32 @@ function mergeConstraints(a, b) {
   return { permitted: [...a.permitted, ...b.permitted], excluded: [...a.excluded, ...b.excluded] };
 }
 
-async function verifySignature(issuerCert, cert) {
+// 签名结果缓存：签名有效性只取决于（签发者, 证书）二元组，
+// 多候选链共享边时避免重复验签（key = `${issuerSha256}>${certSha256}`）。
+async function verifySignature(issuerCert, cert, cache) {
+  const cacheKey = cache ? `${issuerCert.sha256}>${cert.sha256}` : null;
+  if (cache && cache.has(cacheKey)) return cache.get(cacheKey);
+  let ok = false;
   try {
     const key = await globalThis.crypto.subtle.importKey(
       'spki', issuerCert.spkiRaw, { name: 'ECDSA', namedCurve: 'P-256' }, false, ['verify'],
     );
     const rawSig = derEcdsaToRaw(cert.signatureDer, 32); // DER → WebCrypto raw(r||s)
-    return await globalThis.crypto.subtle.verify(
+    ok = await globalThis.crypto.subtle.verify(
       { name: 'ECDSA', hash: { name: 'SHA-256' } }, key, rawSig, cert.tbs,
     );
   } catch {
-    return false;
+    ok = false;
   }
+  if (cache) cache.set(cacheKey, ok);
+  return ok;
 }
 
-function buildPreferredIssuerLinks(anchor, pool) {
+// 自叶证书向信任锚 DFS，枚举全部候选链：同一主体名称可能对应多张证书
+// （续期 / 密钥轮换的同名中间 CA），每个候选签发者都要展开尝试，
+// 而不是只取摘要最小者。候选签发者按 SHA-256 摘要排序后展开，
+// 保证枚举结果与候选证书录入顺序无关。
+function buildCandidateChains(leaf, anchor, pool) {
   const bySubject = new Map();
   for (const cert of pool) {
     if (!bySubject.has(cert.subjectKey)) bySubject.set(cert.subjectKey, []);
@@ -94,49 +106,45 @@ function buildPreferredIssuerLinks(anchor, pool) {
     list.sort((a, b) => (a.sha256 < b.sha256 ? -1 : a.sha256 > b.sha256 ? 1 : 0));
   }
 
-  const links = new Map();
-  for (const cert of pool) {
-    if (cert.issuerKey === anchor.subjectKey) {
-      links.set(cert.sha256, anchor);
-      continue;
-    }
-    const issuers = bySubject.get(cert.issuerKey);
-    if (issuers && issuers.length > 0) links.set(cert.sha256, issuers[0]);
-  }
-  return links;
-}
-
-function followPreferredIssuerLinks(leaf, anchor, links) {
+  const chains = [];
+  const errors = [];
   const path = [leaf];
   const seen = new Set([leaf.sha256]);
-  let current = leaf;
-  while (current !== anchor) {
-    const issuer = links.get(current.sha256);
-    if (!issuer) {
-      return {
-        error: {
-          stage: 'chain', label: current.label,
-          message: `找不到 “${current.issuer.str}” 的签发者证书，链路无法到达信任锚`,
-        },
-      };
+
+  const dfs = (current) => {
+    if (current.issuerKey === anchor.subjectKey) {
+      chains.push([...path, anchor]);
+      return;
     }
-    if (seen.has(issuer.sha256)) {
-      return {
-        error: {
+    const issuers = bySubject.get(current.issuerKey) || [];
+    if (issuers.length === 0) {
+      errors.push({
+        stage: 'chain', label: current.label,
+        message: `找不到 “${current.issuer.str}” 的签发者证书，链路无法到达信任锚`,
+      });
+      return;
+    }
+    for (const issuer of issuers) {
+      if (seen.has(issuer.sha256)) {
+        errors.push({
           stage: 'cycle', label: issuer.label,
           message: `检测到循环签发：“${issuer.subject.str}” 已在当前链路径中`,
-        },
-      };
+        });
+        continue;
+      }
+      seen.add(issuer.sha256);
+      path.push(issuer);
+      dfs(issuer);
+      path.pop();
+      seen.delete(issuer.sha256);
     }
-    path.push(issuer);
-    seen.add(issuer.sha256);
-    current = issuer;
-  }
-  return { path };
+  };
+  dfs(leaf);
+  return { chains, errors };
 }
 
 // 核验单条候选链（chain[0]=叶，chain[n-1]=锚）。成功返回逐级依据，失败返回首个失败环节。
-async function verifyOneChain(chain, host, at) {
+async function verifyOneChain(chain, host, at, sigCache) {
   const n = chain.length;
   const notes = chain.map(() => []);
 
@@ -206,7 +214,7 @@ async function verifyOneChain(chain, host, at) {
 
     if (!isAnchor) {
       const issuer = chain[i + 1];
-      if (!(await verifySignature(issuer, c))) {
+      if (!(await verifySignature(issuer, c, sigCache))) {
         return failAt('signature', i,
           `签名验证失败：签发者 ${issuer.label}（${issuer.subject.str}）的公钥无法验证该证书`);
       }
@@ -287,14 +295,13 @@ export async function verifyChainSet({ anchorDer, certDers, dnsName, verifyTime 
     return fail('hostname', 0, null, `目标主机名 “${host}” 未列入任何终端实体证书的 SAN`);
   }
 
-  // —— 构造候选链（叶 → 锚，DFS，检测循环签发）
-  const links = buildPreferredIssuerLinks(anchor, uniq);
+  // —— 构造候选链（叶 → 锚，DFS 展开全部同名候选签发者，检测循环签发）
   const candidates = [];
   const buildErrors = [];
   for (const leaf of leaves) {
-    const built = followPreferredIssuerLinks(leaf, anchor, links);
-    if (built.error) buildErrors.push(built.error);
-    else candidates.push(built.path);
+    const built = buildCandidateChains(leaf, anchor, uniq);
+    candidates.push(...built.chains);
+    buildErrors.push(...built.errors);
   }
   if (candidates.length === 0) {
     const e = buildErrors[0] || { stage: 'chain', label: null, message: '无法构造到达信任锚的候选链' };
@@ -310,9 +317,10 @@ export async function verifyChainSet({ anchorDer, certDers, dnsName, verifyTime 
   });
 
   // —— 逐级核验；多链成立时取摘要序最小者
+  const sigCache = new Map();
   const failures = [];
   for (const cand of candidates) {
-    const res = await verifyOneChain(cand, host, at);
+    const res = await verifyOneChain(cand, host, at, sigCache);
     if (res.ok) return res;
     failures.push(res);
   }

@@ -361,5 +361,120 @@ const run = (anchor, certs, dns = 'app.example.com', at = T) =>
     atNotAfter.ok ? '' : atNotAfter.message);
 }
 
+// ---------- 场景 22~26：同名中间 CA（续期 / 密钥轮换） ----------
+// 构造：信任锚 + 两张主体同名（Ground Relay CA）的中间 CA + 目标 ground.example.com 的叶证书。
+// front / back 按 DER SHA-256 摘要排序（front 摘要更小）；sameKey 模拟续期未换钥。
+function makeGroundWorld({ sameKey = false } = {}) {
+  const rootK = makeKeys();
+  const anchor = makeCert({
+    subjectCN: 'Ground Root CA', issuerCN: 'Ground Root CA',
+    subjectPubKey: rootK.publicKey, issuerPrivKey: rootK.privateKey,
+    isCA: true, keyUsage: { keyCertSign: true, crlSign: true },
+    serial: 100, notBefore: NB, notAfter: NA,
+  });
+  const kA = makeKeys();
+  const kB = sameKey ? kA : makeKeys();
+  const mkInter = (k, serial) => makeCert({
+    subjectCN: 'Ground Relay CA', issuerCN: 'Ground Root CA',
+    subjectPubKey: k.publicKey, issuerPrivKey: rootK.privateKey,
+    isCA: true, pathLen: 0, keyUsage: { keyCertSign: true },
+    serial, notBefore: NB, notAfter: NA,
+  });
+  const cand = [
+    { der: mkInter(kA, 201), k: kA },
+    { der: mkInter(kB, 202), k: kB },
+  ].map((c) => ({ ...c, d: createHash('sha256').update(c.der).digest('hex') }));
+  cand.sort((x, y) => (x.d < y.d ? -1 : 1));
+  const [front, back] = cand;
+  const mkLeaf = (issuerPrivKey, extra = {}) => makeCert({
+    subjectCN: 'ground.example.com', issuerCN: 'Ground Relay CA',
+    subjectPubKey: makeKeys().publicKey, issuerPrivKey,
+    keyUsage: { digitalSignature: true }, sanDns: ['ground.example.com'],
+    serial: 300, notBefore: NB, notAfter: NA, ...extra,
+  });
+  return { anchor, front, back, mkLeaf };
+}
+
+// ---------- 场景 22：同名中间 CA 仅一张可用 → 选中实际签发者 ----------
+{
+  const w = makeGroundWorld();
+  // 22a：叶证书仅由摘要靠后的中间 CA 签发（密钥轮换后的新证书），
+  //      摘要靠前者无法验证叶签名，但不应妨碍备用链成立
+  const leafBack = w.mkLeaf(w.back.k.privateKey);
+  const resBack = await run(w.anchor, [leafBack, w.front.der, w.back.der], 'ground.example.com');
+  ok('场景22a：同名 CA 中叶由摘要靠后者签发 → 备用链成立',
+    assertOk(resBack, '备用链') === true && resBack.chain[1].sha256 === w.back.d,
+    resBack.ok ? `L1=${resBack.chain[1].sha256}` : `[${resBack.stage}] ${resBack.message}`);
+  // 22b：叶证书由摘要靠前者签发（对照方向）
+  const leafFront = w.mkLeaf(w.front.k.privateKey);
+  const resFront = await run(w.anchor, [leafFront, w.front.der, w.back.der], 'ground.example.com');
+  ok('场景22b：同名 CA 中叶由摘要靠前者签发 → 链成立',
+    assertOk(resFront, '前排签发') === true && resFront.chain[1].sha256 === w.front.d,
+    resFront.ok ? `L1=${resFront.chain[1].sha256}` : `[${resFront.stage}] ${resFront.message}`);
+  // 22c：备用链保留逐级签名与策略依据
+  ok('场景22c：备用链保留逐级签名与策略依据',
+    resBack.ok && resBack.chain.length === 3
+    && resBack.chain[0].notes.some((n) => n.includes('签名经 L1'))
+    && resBack.chain[1].notes.some((n) => n.includes('CA=true'))
+    && resBack.chain[1].notes.some((n) => n.includes('keyCertSign'))
+    && resBack.chain[2].isAnchor);
+}
+
+// ---------- 场景 23：同名中间 CA 下输入顺序变化不改变结论 ----------
+{
+  const w = makeGroundWorld();
+  const leaf = w.mkLeaf(w.back.k.privateKey);
+  const orders = [
+    [leaf, w.front.der, w.back.der],
+    [w.back.der, leaf, w.front.der],
+    [w.front.der, w.back.der, leaf],
+  ];
+  const keys = [];
+  let allOk = true;
+  for (const certs of orders) {
+    const res = await run(w.anchor, certs, 'ground.example.com');
+    allOk &&= res.ok;
+    if (res.ok) keys.push(res.chain.map((c) => c.sha256).join('|'));
+  }
+  ok('场景23：候选证书录入顺序变化 → 选中链一致',
+    allOk && keys.length === 3 && keys.every((k) => k === keys[0]) && keys[0].includes(w.back.d),
+    keys.join(' vs '));
+}
+
+// ---------- 场景 24：同名同钥续期、两条链均有效 → 按完整链摘要稳定择链 ----------
+{
+  const w = makeGroundWorld({ sameKey: true }); // 续期未换钥：叶签名对两张同名 CA 均有效
+  const leaf = w.mkLeaf(w.front.k.privateKey);
+  const res1 = await run(w.anchor, [leaf, w.front.der, w.back.der], 'ground.example.com');
+  const res2 = await run(w.anchor, [w.back.der, w.front.der, leaf], 'ground.example.com');
+  ok('场景24：两条同名链均有效 → 稳定选中摘要更小者（与顺序无关）',
+    res1.ok && res2.ok
+    && res1.chain[1].sha256 === w.front.d
+    && res2.chain[1].sha256 === w.front.d,
+    `期望 L1=${w.front.d}，实际 ${res1.ok ? res1.chain[1].sha256 : res1.message}`
+    + ` / ${res2.ok ? res2.chain[1].sha256 : res2.message}`);
+}
+
+// ---------- 场景 25：同名中间 CA 均无法验证叶签名 → 拒绝 ----------
+{
+  const w = makeGroundWorld();
+  const ghost = makeKeys(); // 叶的实际签发者不在证书包中
+  const leaf = w.mkLeaf(ghost.privateKey);
+  const res = await run(w.anchor, [leaf, w.front.der, w.back.der], 'ground.example.com');
+  ok('场景25：同名 CA 均非实际签发者 → 拒绝(signature)',
+    assertFail(res, 'signature', '同名均不可用') === true && res.level === 0,
+    res.ok ? '意外成功' : `[${res.stage}] L${res.level} ${res.message}`);
+}
+
+// ---------- 场景 26：证书包中无可用签发者 → 拒绝(chain) ----------
+{
+  const w = makeGroundWorld();
+  const leaf = w.mkLeaf(w.front.k.privateKey, { issuerCN: 'Ghost CA' });
+  const res = await run(w.anchor, [leaf, w.front.der, w.back.der], 'ground.example.com');
+  ok('场景26：签发者名称不在证书包中 → 拒绝(chain)',
+    assertFail(res, 'chain', '无可用签发者') === true && res.message.includes('找不到'),
+    res.ok ? '意外成功' : `[${res.stage}] ${res.message}`);
+}
+
 console.log(`\n${passed} 项通过，${failed} 项失败`);
 process.exit(failed === 0 ? 0 : 1);
