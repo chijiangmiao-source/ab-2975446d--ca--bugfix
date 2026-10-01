@@ -9,7 +9,8 @@
 - 仅接受 **X.509 v3**、**P-256（secp256r1）ECDSA / SHA-256** 证书；其他版本、曲线或签名算法直接拒绝。
 - 解析时保留待验签的**原始 TBSCertificate 字节**；DER 编码的 ECDSA 签名（`SEQUENCE {r, s}`）
   被准确转换为 WebCrypto 所需的 raw 格式（`r || s`，各 32 字节补零）。
-- 在 Worker 中从叶证书向信任锚 DFS 构造候选链，逐级核验：
+- 在 Worker 中从叶证书向信任锚 DFS 枚举全部候选链（同一主体名、不同公钥的续期/轮换 CA
+  各自独立成分支，构造阶段不预选签发者），逐级核验：
   签名、有效期、CA 与 keyUsage（keyCertSign）、pathLenConstraint，
   以及自顶向下**累积的 DNS permitted / excluded 名称约束**（RFC 5280 语义：
   `example.com` 覆盖本身与子域，`.example.com` 仅覆盖子域）。
@@ -42,7 +43,8 @@ docker compose run --rm verify              # 单次验收容器，退出码即�
 ```
 
 `verify` 容器依次执行：逻辑测试（有效链、permitted/excluded 受限域名拒绝、
-pathLen 违约、签名篡改、循环签发、截断 DER、未知关键扩展、多链稳定选择等场景）→
+pathLen 违约、签名篡改、循环签发、截断 DER、未知关键扩展、多链稳定选择、
+同名主体续期/轮换中间 CA 的备用链与输入顺序无关性等场景）→
 页面构建 → HTTP 冒烟（页面、/health、静态资源、404），全部通过以退出码 0 退出，否则 1。
 
 ## 目录结构
